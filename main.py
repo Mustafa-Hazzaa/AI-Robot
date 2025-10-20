@@ -22,7 +22,7 @@ audio_queue = Queue()
 def get_ultrasonic_data():
     """Simulates getting the latest sensor readings."""
     # This must be a fast, non-blocking read!
-    return {"front": 0.52, "left": 1.2, "right": 0.9}
+    return {"front": 100, "left": 10.2, "right": 9.0}
 
 
 def worker_thread(audio_queue: Queue, ai_planner: AIPlanner, stt_instance: STT):

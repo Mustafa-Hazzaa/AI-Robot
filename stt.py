@@ -14,7 +14,7 @@ class STT:
     SAMPLE_RATE = 16000
     MIC_NAME = "soundcore Liberty 4 NC"
     MODEL_SIZE = "small.en"
-    SILENCE_THRESHOLD = 500
+    SILENCE_THRESHOLD = 800
     SILENCE_DURATION = 2.0
 
     def __init__(self, callback):
