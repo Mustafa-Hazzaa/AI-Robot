@@ -1,14 +1,22 @@
 # main.py
 from flask import Flask, jsonify, request
 from stt import STT
-from AI import AIPlanner
+from AI import AIPlanner  # Make sure your AI.py file is named AI.py or change this
 import threading
 import time
 from queue import Queue
 import json
 import numpy as np
+import queue  # Import the standard queue module
 
 app = Flask(__name__)
+
+# --- Thread-Safe Global State ---
+# We need to store the Pi's latest state and the newest plan
+g_current_distances = {"front": 100.0}
+g_state_lock = threading.Lock()
+g_plan_queue = Queue()  # Holds complete plans for the Pi
+# --------------------------------
 
 # Initialize modules
 ai = AIPlanner()
@@ -17,70 +25,59 @@ ai = AIPlanner()
 audio_queue = Queue()
 
 
-# --- Placeholder for Real Ultrasonic Data ---
-# In a real robot, this would be read from a sensor hardware interface.
-def get_ultrasonic_data():
-    """Simulates getting the latest sensor readings."""
-    # This must be a fast, non-blocking read!
-    return {"front": 100, "left": 10.2, "right": 9.0}
-
-
 def worker_thread(audio_queue: Queue, ai_planner: AIPlanner, stt_instance: STT):
     """
     A dedicated thread that handles the heavy processing (Whisper/LLM).
     """
-    print("👷 Worker thread started, waiting for commands...")
+    print("👷 Worker thread started, waiting for audio commands...")
     while True:
-        # Blocks until an item is available: (audio_array, distances)
-        audio_array, distances = audio_queue.get()
+        # Blocks until an audio array is available
+        # --- FIX 1: Only get audio_array, not distances ---
+        audio_array = audio_queue.get()
 
         # 1. Perform transcription (heavy task)
         transcript = stt_instance.model_transcribe(audio_array)
 
-        # --- NEW: Clean the Transcribed Command Input ---
-        # 1. Remove leading/trailing whitespace (e.g., ' Move forward.' -> 'Move forward.')
-        cleaned_transcript = transcript.strip()
-
-        # 2. Optionally, remove trailing common punctuation to further normalize
-        # (e.g., 'Move forward.' -> 'Move forward')
+        # 2. Clean the Transcribed Command Input
+        cleaned_transcript = transcript.strip().lower()
         if cleaned_transcript.endswith('.'):
             cleaned_transcript = cleaned_transcript[:-1]
 
-        # 3. Make it lowercase (LLMs often perform better with normalized input)
-        cleaned_transcript = cleaned_transcript.lower()
-        # Example: 'move forward'
+        if not cleaned_transcript:
+            print("🎙️ Heard empty audio, ignoring.")
+            audio_queue.task_done()
+            continue
 
-        # 2. Perform AI planning (heavy task)
-        print(f"\n✨ Worker Processing Cleaned Command: '{cleaned_transcript}'")
+        # 3. Get the most recent sensor data from our global state
+        with g_state_lock:
+            local_distances = g_current_distances.copy()
+
+        print(f"\n✨ Worker Processing: '{cleaned_transcript}' with distances {local_distances}")
+
+        # 4. Perform AI planning (heavy task)
         try:
-            # Use the cleaned_transcript here!
-            plan = ai_planner.generate_plan(cleaned_transcript, distances)
+            plan = ai_planner.generate_plan(cleaned_transcript, local_distances)
 
-            # 3. Handle the generated plan (THIS IS YOUR API REQUEST SUCCESS)
-            import json
-            print("\n🤖 GENERATED PLAN (to be executed by robot):")
+            # 5. Put the finished plan on the queue for the Pi to fetch
+            g_plan_queue.put(plan)
+
+            print("\n🤖 GENERATED PLAN (waiting for Pi to fetch):")
             print(json.dumps(plan, indent=2))
 
         except Exception as e:
-            # Note: The output cleaning logic in AI.py should still be there
-            # as a backup for the LLM's output.
             print(f"❌ Worker Error during plan generation: {e}")
 
         audio_queue.task_done()
 
 
+# --- FIX 2: Corrected function signature ---
 def command_callback_queue(audio_array: np.ndarray):
     """
-    This function is executed by the background SST thread
-    whenever a full command is recorded (NO TRANSCRIPTION HERE).
-    It just queues the data.
+    Lightweight callback from STT. Just puts the audio in the queue.
     """
-    # 1. Get current sensor data (lightweight read)
-    distances = get_ultrasonic_data()
-
-    # 2. Put the heavy task data (audio + sensor data) into the queue
-    audio_queue.put((audio_array, distances))
-    print("📝 Command recorded and queued for processing.")
+    # Put the heavy task data (audio) into the queue
+    audio_queue.put(audio_array)
+    print("📝 Command audio recorded and queued for processing.")
 
 
 # Initialize SST and pass the lightweight queuing callback function
@@ -92,10 +89,43 @@ def index():
     return "🤖 Autonomous Robot MCP running (Voice command worker active)"
 
 
-@app.route("/decide", methods=["POST"])
-def decide():
-    # This endpoint remains for debugging/manual API calls
-    return jsonify({"status": "Voice control is backgrounded. Command processing handled by worker thread."})
+# --- NEW ENDPOINT 1 ---
+@app.route("/submit_state", methods=["POST"])
+def submit_state():
+    """
+    Called by the Raspberry Pi very frequently to report its sensor data.
+    """
+    try:
+        data = request.get_json(force=True)
+        with g_state_lock:
+            global g_current_distances
+            g_current_distances = data.get("distances", {"front": 100.0})
+        # print(f"State update: {g_current_distances}") # Uncomment for debugging
+        return jsonify({"status": "received"})
+    except Exception as e:
+        print(f"❌ Error in /submit_state: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# --- NEW ENDPOINT 2 ---
+@app.route("/get_command", methods=["GET"])
+def get_command():
+    """
+    Called by the Raspberry Pi in its loop, asking "any new plans for me?"
+    """
+    try:
+        # Try to get a plan from the queue without blocking
+        plan = g_plan_queue.get_nowait()
+        return jsonify(plan)
+    except queue.Empty:
+        # This is normal. It just means no new voice command has been processed.
+        return jsonify([])  # Return an empty list
+    except Exception as e:
+        print(f"❌ Error in /get_command: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# --- OLD /decide ENDPOINT IS REMOVED ---
 
 
 if __name__ == "__main__":
@@ -110,5 +140,4 @@ if __name__ == "__main__":
 
     # 3. Start the Flask server in the main thread
     print("🌐 Flask server starting...")
-    # debug=False and use_reloader=False are essential when using threading
     app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
